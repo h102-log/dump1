@@ -36,7 +36,7 @@
 
 <div id="hud"><div>
   <h1>SPRAWL</h1>
-  <p class="sub">파일 하나가 건물 하나. 높이는 크기, 창문 불빛은 최근에 손댄 정도.</p>
+  <p class="sub">폴더 하나가 건물 하나, 파일 하나가 층 하나. 층 두께는 크기, 창문 불빛은 최근에 손댄 정도.</p>
   <table>
     <tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td><td>이동</td></tr>
     <tr><td><kbd>Space</kbd> / <kbd>Shift</kbd></td><td>상승 / 하강</td></tr>
@@ -64,12 +64,16 @@
   var THREE = SPRAWL.THREE;
 
   // render.py가 계산해 넣는다. 여기 JS는 렌더만 한다 (SPEC 13).
-  var B = /*BUILDINGS*/;      // 건물: x z w d h b n
-  var K = /*BLOCKS*/;         // 구역 경계: [x, z, w, d]
+  var T = /*TOWERS*/;         // 건물 껍질 = 폴더: x z w d (부지, 모서리 기준) y h depth n
+  var F = /*FLOORS*/;         // 층 = 파일: x z w d y t b n owner
 
   // --- 눈으로 보고 조정하는 렌더 상수 ---
   var WINDOW = 0.85;          // 창문 격자 간격 (월드 단위)
-  var FOG = 0.0135;           // FogExp2 밀도
+  var FOG = 0.004;            // FogExp2 밀도. 0.0135는 초기 카메라 거리(~250)에서 99% 차폐라 도시가 안 보였다
+  var GLASS = 0.30;           // 닫힌 껍질이 그리는 픽셀 비율 (루트). 디더 스크린도어 (SPEC 69)
+  var GLASS_STEP = 0.04;      // 깊이 한 단마다 이만큼 덜 그린다 — 깊이가 곧 흐림 (SPEC 70)
+  var GLASS_MIN = 0.08;
+  var LABEL_PX = 32;          // 층 라벨 캔버스: 월드 1 단위당 픽셀
   var SPEED = 26, BOOST = 2.6, LOOK = 1.9;
   var SKY = new THREE.Color(0x070b16);
 
@@ -97,9 +101,9 @@
   scene.fog = new THREE.FogExp2(SKY, FOG);
   var camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.1, 3000);
 
-  // --- 건물: InstancedMesh 하나. 밝기는 per-instance 속성 (SPEC 43) ---
+  // --- 층: InstancedMesh 하나. 밝기는 per-instance 속성 (SPEC 15, 43) ---
   var COMMON = [
-    "varying float vB; varying vec3 vL; varying vec3 vN; varying float vD;",
+    "varying float vB; varying float vT; varying vec3 vL; varying vec3 vN; varying float vD;",
     "float hash(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.7))) * 43758.5453); }"
   ].join("\n");
 
@@ -120,6 +124,7 @@
       // 인스턴스 중심 기준 오프셋. 스케일이 이미 반영돼 있으므로 월드 단위다 —
       // 격자를 이 값으로 끊으면 건물이 높든 낮든 창문 한 칸의 크기가 같다 (SPEC 47).
       "  vL = ip.xyz - instanceMatrix[3].xyz;",
+      "  vT = length(vec3(instanceMatrix[1]));",    // 인스턴스 y 스케일 = 층 두께
       "  vN = normalize(mat3(instanceMatrix) * normal);",
       "  vec4 mv = modelViewMatrix * ip;",
       "  vD = -mv.z;",
@@ -132,10 +137,12 @@
       "  vec3 an = abs(normalize(vN));",
       "  vec3 col;",
       "  if (an.y > 0.5) {",
-      "    col = uWall * 0.5;",                     // 지붕에는 창문이 없다
+      "    col = uWall * 0.5;",                     // 층의 윗면·아랫면에는 창문이 없다
       "  } else {",
       "    vec2 g = (an.x > an.z) ? vec2(vL.z, vL.y) : vec2(vL.x, vL.y);",
-      "    vec2 c = g / uWin;",
+      // 세로 격자는 층 두께에 정수 줄로 맞춘다 — 층 경계와 창문 줄이 어긋나지 않고, 얇은 층도 한 줄은 켜진다 (S18·S23)
+      "    float rows = max(1.0, floor(vT / uWin + 0.5));",
+      "    vec2 c = vec2(g.x / uWin, (g.y / vT + 0.5) * rows);",
       "    vec2 id = floor(c); vec2 f = fract(c);",
       "    float pane = step(0.16, f.x) * step(f.x, 0.84) * step(0.2, f.y) * step(f.y, 0.8);",
       "    float lit = step(1.0 - vB * 0.92, hash(id));",   // 밝을수록 켜진 창이 많다
@@ -148,27 +155,26 @@
     ].join("\n")
   });
 
-  if (B.length) {
-    var mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), mat, B.length);
-    var bright = new Float32Array(B.length);
+  if (F.length) {
+    var floorsMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), mat, F.length);
+    var bright = new Float32Array(F.length);
     var m4 = new THREE.Matrix4();
-    for (var i = 0; i < B.length; i++) {
-      var b = B[i];
-      m4.makeScale(b.w, b.h, b.d);
-      m4.setPosition(b.x, b.y + b.h / 2, b.z);
-      mesh.setMatrixAt(i, m4);
-      bright[i] = b.b;
+    for (var i = 0; i < F.length; i++) {
+      var fl = F[i];
+      m4.makeScale(fl.w, fl.t, fl.d);
+      m4.setPosition(fl.x + fl.w / 2, fl.y + fl.t / 2, fl.z + fl.d / 2);
+      floorsMesh.setMatrixAt(i, m4);
+      bright[i] = fl.b;
     }
-    mesh.geometry.setAttribute("bright", new THREE.InstancedBufferAttribute(bright, 1));
-    scene.add(mesh);
+    floorsMesh.geometry.setAttribute("bright", new THREE.InstancedBufferAttribute(bright, 1));
+    scene.add(floorsMesh);
   }
 
   // --- 젖은 바닥. 진짜 반사 대신 얼룩 + 블룸 번짐으로 흉내낸다 (SPEC 20, S13) ---
-  var root = K.length ? K[0] : { x: -110, z: -110, w: 220, d: 220, y: 0, n: "" };
+  var root = T.length ? T[0] : { x: -110, z: -110, w: 220, d: 220, y: 0, h: 0, n: "" };
   var cx = root.x + root.w / 2, cz = root.z + root.d / 2;
   var span = Math.max(root.w, root.d);
-  var topY = 0;
-  for (var t = 0; t < K.length; t++) if (K[t].y > topY) topY = K[t].y;
+  var topY = root.y + root.h;    // 루트 건물의 지붕 — 도시에서 가장 높은 점 (SPEC 12b, 57)
 
   var floorMat = new THREE.ShaderMaterial({
     uniforms: { uFog: { value: SKY }, uFogD: { value: FOG } },
@@ -200,16 +206,21 @@
   ground.position.set(cx, -0.02, cz);
   scene.add(ground);
 
-  // --- 구역 플랫폼: 바닥부터 자기 단 윗면까지 솟은 블록 (SPEC 62) ---
-  // 건물과 같은 패턴이라 InstancedMesh 하나면 된다. 깊이가 곧 고도라서 계단이 보인다.
-  if (K.length) {
-    var pmat = new THREE.ShaderMaterial({
+  // --- 건물 껍질: 폴더 하나에 유리 상자 하나. 열림·깊이는 per-instance 속성 (SPEC 43, 67-70) ---
+  // 닫힌 벽은 알파 블렌딩이 아니라 디더(스크린도어)다 — depthWrite가 살아 있으니 인스턴스 정렬이
+  // 필요 없고, 겹친 유리 여섯 겹이 순서에 따라 깜빡이지 않는다 (SPEC 69).
+  var openA = new Float32Array(T.length), depthA = new Float32Array(T.length);
+  var shell = null;
+  if (T.length) {
+    var shellMat = new THREE.ShaderMaterial({
       uniforms: { uFog: { value: SKY }, uFogD: { value: FOG },
-                  uTop: { value: new THREE.Color(0x101d33) },
-                  uSide: { value: new THREE.Color(0x060c18) } },
+                  uGlass: { value: new THREE.Color(0x1d3d5e) },
+                  uCov: { value: GLASS }, uStep: { value: GLASS_STEP }, uMin: { value: GLASS_MIN } },
       vertexShader: [
-        "varying vec3 vN; varying float vD;",
+        "attribute float open; attribute float depth;",
+        "varying float vO; varying float vDp; varying vec3 vN; varying float vD;",
         "void main(){",
+        "  vO = open; vDp = depth;",
         "  vec4 ip = instanceMatrix * vec4(position, 1.0);",
         "  vN = normalize(mat3(instanceMatrix) * normal);",
         "  vec4 mv = modelViewMatrix * ip; vD = -mv.z;",
@@ -217,34 +228,34 @@
         "}"
       ].join("\n"),
       fragmentShader: [
-        "uniform vec3 uFog, uTop, uSide; uniform float uFogD;",
-        "varying vec3 vN; varying float vD;",
+        "uniform vec3 uFog, uGlass; uniform float uFogD, uCov, uStep, uMin;",
+        "varying float vO; varying float vDp; varying vec3 vN; varying float vD;",
+        // 4x4 베이어 행렬을 산술로 만든다 — GLSL ES 1.0 프래그먼트에서는 배열을 동적 인덱싱할 수 없다.
+        "float b2(vec2 q){ return 2.0 * q.x + 3.0 * q.y - 4.0 * q.x * q.y; }",
+        "float bayer4(vec2 p){ vec2 q = floor(mod(p, 4.0)); vec2 hi = floor(q * 0.5); vec2 lo = q - 2.0 * hi;",
+        "  return (4.0 * b2(lo) + b2(hi) + 0.5) / 16.0; }",
         "void main(){",
-        "  vec3 col = mix(uSide, uTop, step(0.5, abs(normalize(vN).y)));",
+        "  if (vO > 0.5) discard;",                                 // 열린 건물의 벽은 없다 (SPEC 68)
+        "  float cov = max(uMin, uCov - vDp * uStep);",            // 깊을수록 덜 그린다 (SPEC 70)
+        "  if (bayer4(gl_FragCoord.xy) > cov) discard;",
+        "  vec3 col = uGlass * (abs(normalize(vN)).y > 0.5 ? 0.55 : 1.0);",   // 지붕은 조금 어둡게
         "  float f = 1.0 - exp(-uFogD * uFogD * vD * vD);",
         "  gl_FragColor = vec4(mix(col, uFog, clamp(f, 0.0, 1.0)), 1.0);",
         "}"
       ].join("\n")
     });
-    var pmesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), pmat, K.length);
-    var pm = new THREE.Matrix4();
-    var pts = [];
-    for (var j = 0; j < K.length; j++) {
-      var r = K[j];
-      pm.makeScale(r.w, r.y, r.d);
-      pm.setPosition(r.x + r.w / 2, r.y / 2, r.z + r.d / 2);
-      pmesh.setMatrixAt(j, pm);
-      // 단 윗면 테두리를 네온으로 그어 계단을 또렷하게 만든다
-      var x0 = r.x, z0 = r.z, x1 = r.x + r.w, z1 = r.z + r.d, ey = r.y + 0.02;
-      pts.push(x0, ey, z0, x1, ey, z0, x1, ey, z0, x1, ey, z1,
-               x1, ey, z1, x0, ey, z1, x0, ey, z1, x0, ey, z0);
+    shell = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), shellMat, T.length);
+    var sm = new THREE.Matrix4();
+    for (var j = 0; j < T.length; j++) {
+      var tw = T[j];
+      sm.makeScale(tw.w, tw.h, tw.d);
+      sm.setPosition(tw.x + tw.w / 2, tw.y + tw.h / 2, tw.z + tw.d / 2);
+      shell.setMatrixAt(j, sm);
+      depthA[j] = tw.depth;
     }
-    scene.add(pmesh);
-    var lg = new THREE.BufferGeometry();
-    lg.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
-    scene.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({
-      color: 0x2d7fa8, transparent: true, opacity: 0.7, fog: true
-    })));
+    shell.geometry.setAttribute("open", new THREE.InstancedBufferAttribute(openA, 1));
+    shell.geometry.setAttribute("depth", new THREE.InstancedBufferAttribute(depthA, 1));
+    scene.add(shell);
   }
 
   // --- 간판 (SPEC 63-65) ---
@@ -276,28 +287,30 @@
     sprite.scale.set(worldH * (w / h), worldH, 1);
   }
 
-  // 폴더와 파일이 하나의 후보 목록을 이룬다. 점수 = 가중치 * 크기 / 거리라서 큰 폴더는
-  // 멀리서도 뜨고 작은 파일은 코앞에서만 뜬다.
+  // 폴더 이름은 그 건물의 지붕 위에 뜬다. 점수 = 부지 짧은 변 / 거리라서 큰 폴더는 멀리서도 뜬다.
+  // 지붕에 두는 이유: 중첩 폴더의 부지 중심은 거의 같아서(docs/next/202608) 같은 높이에 두면
+  // 한자리에 포개진다. 부모 지붕은 자식 지붕보다 항상 ROOF 만큼 높으므로 (SPEC 12b) y로 갈린다 —
+  // 단, render.py 의 ROOF >= SIGN_MAX 여야 간판 높이가 그 틈에 들어간다.
+  // 파일 이름은 이 풀에 없다 — 열린 건물의 층 라벨로만 읽힌다 (SPEC 64, 71).
   //
   // 구역마다 스프라이트를 상시 세우던 방식을 버린 이유는 드로우콜이 아니라 겹침이다.
   // node_modules(구역 119)에서 간판 143개가 동시에 떠 "node_modules"와 "three"가 한자리에
   // 포개져 "nodethreedules"로 읽혔다 — 2026-08-30 실측.
   var SIGN_POOL = 24;     // 한 화면에 뜨는 간판 총수
-  var SIGN_MAX = 7.0;     // 간판 월드 높이 상한. 없으면 루트 폴더 하나가 화면을 덮는다
-  var FOLDER_BIAS = 4.0;  // 같은 거리면 폴더가 이긴다 — 동네 이름이 가게 이름보다 크다
+  var SIGN_MAX = 5.0;     // 간판 월드 높이 상한. render.py 의 ROOF 이하여야 한다 (위 주석)
+  var SIGN_DECAY = 0.7;   // 급(lvl)이 하나 오를 때마다 간판이 이만큼 작아진다 — 위계가 글자 크기로 읽힌다 (SPEC 63)
+  var SIGN_MIN = 0.8;
 
   var CAND = [];
-  for (var s = 0; s < K.length; s++) {
-    var kr = K[s], kspan = Math.min(kr.w, kr.d);   // `span`은 도시 크기다 (163줄) — 가리지 마라
-    var ksz = Math.min(SIGN_MAX, Math.max(2.2, kspan * 0.22));
+  for (var s = 0; s < T.length; s++) {
+    var kr = T[s], kspan = Math.min(kr.w, kr.d);   // `span`은 도시 크기다 — 가리지 마라
+    // 상한을 먼저 걸고 급(lvl)으로 줄인다. 상한만 있으면 짧은 변 23 이상인 폴더가 전부 같은 크기라
+    // src 와 그 안의 renderers 가 구분되지 않았다 (2026-09-02 실측). 루트(0급)와 대분류(1급)는
+    // 같은 크기다 — 루트는 도시 이름이고 첫 화면에서 읽혀야 하는 것은 대분류다.
+    var ksz = Math.max(SIGN_MIN, Math.min(SIGN_MAX, kspan * 0.22) * Math.pow(SIGN_DECAY, Math.max(0, kr.lvl - 1)));
     // 점수에는 상한 없는 kspan 을 쓴다 — 표시 크기는 묶되 "큰 폴더가 멀리서도 뜬다"는 살린다
-    CAND.push({ n: kr.n, x: kr.x + kr.w / 2, y: kr.y + ksz * 1.2, z: kr.z + kr.d / 2,
-                sz: ksz, sc: FOLDER_BIAS * kspan, col: "#9ff0ff" });
-  }
-  for (var s = 0; s < B.length; s++) {
-    var bd = B[s];
-    CAND.push({ n: bd.n, x: bd.x, y: bd.y + bd.h + 1.4, z: bd.z,
-                sz: 1.5, sc: 1.5, col: "#ffd9a8" });
+    CAND.push({ n: kr.n, x: kr.x + kr.w / 2, y: kr.y + kr.h + ksz * 0.6, z: kr.z + kr.d / 2,
+                sz: ksz, sc: kspan, col: "#9ff0ff" });
   }
 
   var signs = [], signOf = [];
@@ -339,9 +352,100 @@
     }
   }
 
+  // --- 열림 판정 (SPEC 67): 카메라가 xz 와 y 부피 안에 있는 건물만 연다 ---
+  // 포함 관계(11b·11d)가 보장되므로 건물마다 독립으로 봐도 루트부터의 경로가 함께 열린다.
+  // 매 프레임 선형 스캔 — 폴더 621개는 공짜다 (S21).
+  var deepest = -1, inside = new Uint8Array(T.length);
+  function updateOpen() {
+    if (!shell) return;
+    var p = camera.position, best = 0;
+    inside[0] = 1;                                // 루트는 항상 열려 있다 (SPEC 67)
+    for (var i = 1; i < T.length; i++) {
+      var t = T[i];
+      inside[i] = (p.x >= t.x && p.x <= t.x + t.w && p.z >= t.z && p.z <= t.z + t.d &&
+                   p.y >= t.y && p.y <= t.y + t.h) ? 1 : 0;
+      if (inside[i] && t.depth > T[best].depth) best = i;
+    }
+    // 카메라를 품은 건물들은 포함 관계(11b)로 best 의 조상 사슬이다 — best 가 그대로면 바뀐 게 없다 (SPEC 72)
+    if (best === deepest) return;
+    deepest = best;
+    // 벽을 안 그리는 건물 셋 (SPEC 68, 70b):
+    //  - 0급: 루트에서 갈림 없이 이어지는 외길 사슬(node_modules/three)은 건물이 아니라 도시 자체다.
+    //    닫힌 채 두면 그 지붕 디더 판이 첫 화면을 통째로 덮는다 — tree-big 은 "big" 간판과 판만 보였다
+    //  - 열린 건물 (카메라를 품은 best 의 조상 사슬)
+    //  - 열린 급 + 1 보다 깊은 급: 밖에서 유리 여섯 겹이 겹치면 안이 뿌옇다. 들어갈수록 한 급씩 드러난다
+    var show = T[best].lvl + 1;
+    for (i = 0; i < T.length; i++) openA[i] = (T[i].lvl === 0 || inside[i] || T[i].lvl > show) ? 1 : 0;
+    shell.geometry.getAttribute("open").needsUpdate = true;
+    bakeLabels(best);
+  }
+
+  // --- 층 라벨 (SPEC 71-73): 가장 깊이 열린 건물의 층 이름을 캔버스 한 장에 굽는다 ---
+  // 층마다 스프라이트를 세우면 110층에서 드로우콜 110이다. 판 넷을 지오메트리 하나로 합쳐
+  // 텍스처 1개, 드로우콜 1개. 판은 껍질 **안쪽** 벽에 붙는다 — 층 슬래브 옆면은 안에서 보면
+  // 뒷면이라 컬링되므로, 층 사이에 서 있으면 자기 층 높이의 이름이 벽에서 읽힌다 (S19).
+  var labelMesh = null;
+  function bakeLabels(ti) {
+    if (labelMesh) {
+      scene.remove(labelMesh);
+      labelMesh.material.map.dispose(); labelMesh.material.dispose(); labelMesh.geometry.dispose();
+      labelMesh = null;
+    }
+    if (ti < 0) return;
+    var own = [];
+    for (var i = 0; i < F.length; i++) if (F[i].owner === ti) own.push(F[i]);
+    if (!own.length) return;
+    var tw = T[ti], f0 = own[0], fn = own[own.length - 1];
+    var y0 = f0.y, y1 = fn.y + fn.t, H = y1 - y0;
+    var pw = Math.min(tw.w, tw.d) - 0.1;
+    if (pw <= 0 || H <= 0) return;
+    // 한 변이 텍스처 상한을 넘으면 층 라벨 높이를 줄인다 (SPEC 73). 110층이면 여기서 걸린다.
+    var maxTex = Math.min(4096, renderer.capabilities.maxTextureSize);
+    var px = Math.min(LABEL_PX, maxTex / H, maxTex / pw);
+    var c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(pw * px));
+    c.height = Math.max(1, Math.round(H * px));
+    var g = c.getContext("2d");
+    g.textBaseline = "middle";
+    g.strokeStyle = "rgba(2,6,14,.92)";
+    g.fillStyle = "#ffd9a8";
+    var pad = Math.max(2, 0.2 * px);
+    for (var k = 0; k < own.length; k++) {
+      var fl = own[k], band = fl.t * px;
+      var fs = Math.min(44, band * 0.72);
+      if (fs < 4) continue;                          // 그려도 읽히지 않는 크기다
+      g.font = fs + 'px "Segoe UI", "Malgun Gothic", system-ui, sans-serif';
+      g.lineWidth = fs * 0.14;
+      var ty = (y1 - fl.y - fl.t / 2) * px;          // 캔버스 y는 아래로 자란다
+      g.strokeText(fl.n, pad, ty, c.width - 2 * pad);
+      g.fillText(fl.n, pad, ty, c.width - 2 * pad);
+    }
+    var tex = new THREE.CanvasTexture(c);
+    tex.minFilter = THREE.LinearFilter;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    // 벽 넷: [바깥 법선 x, z, 안에서 그 벽을 볼 때의 오른쪽 x, z, 중심에서 벽까지]. 벽에서 0.03 안쪽.
+    var mx = tw.x + tw.w / 2, mz = tw.z + tw.d / 2, hx = tw.w / 2 - 0.03, hz = tw.d / 2 - 0.03;
+    var walls = [[0, 1, -1, 0, hz], [0, -1, 1, 0, hz], [1, 0, 0, 1, hx], [-1, 0, 0, -1, hx]];
+    var pos = [], uv = [], idx = [];
+    for (var q = 0; q < 4; q++) {
+      var a = walls[q], ox = mx + a[0] * a[4], oz = mz + a[1] * a[4], rx = a[2] * pw / 2, rz = a[3] * pw / 2;
+      var b = q * 4;
+      pos.push(ox - rx, y0, oz - rz,  ox + rx, y0, oz + rz,  ox + rx, y1, oz + rz,  ox - rx, y1, oz - rz);
+      uv.push(0, 0, 1, 0, 1, 1, 0, 1);
+      idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    geo.setIndex(idx);
+    labelMesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      map: tex, transparent: true, depthWrite: false, fog: false }));
+    scene.add(labelMesh);
+  }
+
   // --- 카메라 초기 위치: 도시 전체가 한눈에 들어온다 (SPEC 57) ---
   camera.position.set(cx, topY + span * 0.45, cz + span * 0.8);
-  camera.lookAt(cx, topY, cz);
+  camera.lookAt(cx, topY * 0.5, cz);
 
   // --- 블룸 (SPEC 20) ---
   var composer = new SPRAWL.EffectComposer(renderer);
@@ -456,7 +560,7 @@
     stats.textContent =
       (statN * 1000 / el).toFixed(0) + " fps   " + (el / statN).toFixed(1) + " ms\n" +
       r.calls + " calls   " + (r.triangles / 1000).toFixed(0) + "k tri\n" +
-      B.length + " bld   " + K.length + " blk   " + document.visibilityState;
+      T.length + " twr   " + F.length + " flr   " + document.visibilityState;
     statLast = now;
     statN = 0;
   }
@@ -468,6 +572,7 @@
     var dt = Math.min(clock.getDelta(), 0.1);
     look(dt);
     move(dt);
+    updateOpen();
     updateSigns(dt);
     composer.render();
     rainU.uT.value += dt;
